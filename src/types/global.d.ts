@@ -19,9 +19,19 @@ declare global {
 		redirect: (url: string, statusCode?: number) => void;
 		sendFile: (filePath: string) => void;
 		download: (filePath: string, fileName?: string) => void;
+		sse: (
+			generator: (() => unknown | Promise<unknown>) | AsyncGenerator<unknown>,
+			intervalMs?: number,
+		) => void;
 	};
 
 	type NextFunction = (err?: unknown) => void;
-
 	type Middleware = (ctx: RequestContext, next: NextFunction) => void;
+	type MimedType = {
+		source: string;
+		charset?: string;
+		compressible?: boolean;
+		extensions?: string[];
+		type?: string;
+	};
 }
