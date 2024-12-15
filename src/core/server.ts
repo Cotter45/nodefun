@@ -2,442 +2,513 @@ import { fileURLToPath } from "node:url";
 import path, { basename } from "node:path";
 import fs, { createReadStream, existsSync, stat } from "node:fs";
 import {
-	createServer as httpCreateServer,
-	type IncomingMessage,
-	type ServerResponse,
-	globalAgent,
+  createServer as httpCreateServer,
+  type IncomingMessage,
+  type ServerResponse,
+  globalAgent,
 } from "node:http";
 
 import { RequestQueue } from "./queue.js";
 import {
-	fetchAndSaveMimeDb,
-	getMimeType,
-	LOCAL_MIME_DB_PATH,
+  fetchAndSaveMimeDb,
+  getMimeType,
+  LOCAL_MIME_DB_PATH,
 } from "./mimes.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-function determineRoutesDir(): string {
-	const isDevelopment = __dirname.includes("src");
-	return isDevelopment
-		? "src/routes"
-		: path.resolve(__dirname, "../", "routes");
+type StaticFile = {
+  filePath: string;
+  mimeType: string;
+};
+
+const staticFilesMap = new Map<string, StaticFile>();
+
+function preloadStaticFiles(staticDirs: string[], baseDir?: string) {
+  // Resolve static directories relative to the current runtime
+  const dirs = staticDirs.map((dir) => path.resolve(dir));
+
+  for (const dir of dirs) {
+    if (!fs.existsSync(dir)) {
+      console.warn(`Static directory not found: ${dir}`);
+      continue;
+    }
+
+    const files = fs.readdirSync(dir, { withFileTypes: true });
+
+    for (const file of files) {
+      const fullPath = path.resolve(dir, file.name);
+
+      if (file.isDirectory()) {
+        // Recursively preload subdirectories
+        preloadStaticFiles([fullPath], baseDir || dir);
+      } else if (file.isFile()) {
+        const relativePath = `/${path
+          .relative(baseDir || dir, fullPath)
+          .replace(/\\/g, "/")}`; // Normalize paths for all platforms
+
+        const mimeType = getMimeType(fullPath) || "application/octet-stream";
+
+        staticFilesMap.set(relativePath, { filePath: fullPath, mimeType });
+      }
+    }
+  }
+  console.log(`Preloaded ${staticFilesMap.size} static files.`);
 }
 
-export async function createServer(
-	routesDir = determineRoutesDir(),
-	config: {
-		maxBodySize?: number;
-		keepAliveTimeout?: number;
-		headersTimeout?: number;
-		maxConcurrentRequests?: number;
-		maxSockets?: number;
-		maxFreeSockets?: number;
-	} = {},
-) {
-	const routes: Array<{
-		method: string;
-		path: RegExp;
-		paramKeys: string[];
-		handler: (ctx: RequestContext) => void;
-	}> = [];
-	const pathMiddlewares: Array<{
-		path: RegExp;
-		middlewares: Middleware[];
-	}> = [];
+function determineRoutesDir(): string {
+  const isDevelopment = __dirname.includes("src");
+  return isDevelopment
+    ? "src/routes"
+    : path.resolve(__dirname, "../", "routes");
+}
 
-	const maxBodySize = config.maxBodySize || 1_000_000;
-	const maxConcurrentRequests = config.maxConcurrentRequests || 100;
+export async function createServer({
+  routesDir,
+  config,
+  staticDirs,
+}: {
+  routesDir?: string;
+  config?: {
+    maxBodySize?: number;
+    keepAliveTimeout?: number;
+    headersTimeout?: number;
+    maxConcurrentRequests?: number;
+    maxSockets?: number;
+    maxFreeSockets?: number;
+  };
+  staticDirs?: string[];
+} = {}) {
+  routesDir = routesDir ?? determineRoutesDir();
+  config = {
+    maxBodySize: 1_000_000,
+    keepAliveTimeout: 10_000,
+    headersTimeout: 6_000,
+    maxConcurrentRequests: 100,
+    maxSockets: Number.POSITIVE_INFINITY,
+    maxFreeSockets: 256,
+    ...config,
+  };
+  staticDirs = staticDirs ?? [];
+  preloadStaticFiles(staticDirs);
 
-	const requestQueue = new RequestQueue(maxConcurrentRequests);
+  const routes: Array<{
+    method: string;
+    path: RegExp;
+    paramKeys: string[];
+    handler: (ctx: RequestContext) => void;
+  }> = [];
+  const pathMiddlewares: Array<{
+    path: RegExp;
+    middlewares: Middleware[];
+  }> = [];
 
-	function normalizePath(path: string): string {
-		return path.replace(/\/+$/, "").replace(/\/+/g, "/") || "/";
-	}
+  const maxBodySize = config.maxBodySize || 1_000_000;
+  const maxConcurrentRequests = config.maxConcurrentRequests || 100;
 
-	const isAsyncGenerator = (
-		gen: AsyncGenerator<unknown> | (() => unknown),
-	): gen is AsyncGenerator<unknown> => {
-		const isObject = typeof gen === "object";
-		return isObject && Symbol.asyncIterator in gen;
-	};
+  let catchAllHandler: ((ctx: RequestContext) => void) | null = null;
+  const requestQueue = new RequestQueue(maxConcurrentRequests);
 
-	function onRequest(req: IncomingMessage, res: ServerResponse) {
-		if (requestQueue.canProcessImmediately()) {
-			handleRequest(req, res);
-		} else {
-			requestQueue.enqueue(() => handleRequest(req, res));
-		}
-	}
+  function normalizePath(path: string): string {
+    return path.replace(/\/+$/, "").replace(/\/+/g, "/") || "/";
+  }
 
-	function handleRequest(req: IncomingMessage, res: ServerResponse) {
-		try {
-			const { method, url } = req;
+  const isAsyncGenerator = (
+    gen: AsyncGenerator<unknown> | (() => unknown)
+  ): gen is AsyncGenerator<unknown> => {
+    const isObject = typeof gen === "object";
+    return isObject && Symbol.asyncIterator in gen;
+  };
 
-			if (!method || !url) {
-				res.writeHead(400, { "Content-Type": "text/plain" });
-				res.end("Bad Request");
-				return;
-			}
+  function onRequest(req: IncomingMessage, res: ServerResponse) {
+    if (requestQueue.canProcessImmediately()) {
+      handleRequest(req, res);
+    } else {
+      requestQueue.enqueue(() => handleRequest(req, res));
+    }
+  }
 
-			const parsedUrl = new URL(url, `http://${req.headers.host}`);
-			const searchParams = Object.fromEntries(parsedUrl.searchParams.entries());
-			const path = normalizePath(parsedUrl.pathname);
+  function handleRequest(req: IncomingMessage, res: ServerResponse) {
+    try {
+      const { method, url } = req;
 
-			const applicableMiddlewares = precomputeMiddlewares(path);
+      if (!method || !url) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("Bad Request");
+        return;
+      }
 
-			let middlewareIdx = 0;
+      const parsedUrl = new URL(url, `http://${req.headers.host}`);
+      const searchParams = Object.fromEntries(parsedUrl.searchParams.entries());
+      const path = normalizePath(parsedUrl.pathname);
 
-			const ctx: RequestContext = {
-				req,
-				res,
-				params: {},
-				searchParams,
-				body: (() => {
-					let parsedBody: unknown;
-					return async () => {
-						if (!parsedBody) {
-							try {
-								parsedBody = await bodyParser(req, res, maxBodySize);
-							} catch (err) {
-								console.error("Error parsing request body:", err);
-							}
-						}
-						return parsedBody;
-					};
-				})(),
-				env: process.env,
+      const applicableMiddlewares = precomputeMiddlewares(path);
 
-				// Response methods
-				status(code: number) {
-					res.statusCode = code;
-					return this;
-				},
-				setHeader(name: string, value: string) {
-					res.setHeader(name, value);
-					return this;
-				},
-				setHeaders(headers: Record<string, string>) {
-					for (const [key, value] of Object.entries(headers)) {
-						res.setHeader(key, value);
-					}
-					return this;
-				},
-				json(data: unknown) {
-					this.setHeader("Content-Type", "application/json");
-					res.end(JSON.stringify(data));
-				},
-				send(data: string | Buffer) {
-					if (typeof data === "string") {
-						this.setHeader("Content-Type", "text/plain");
-					}
-					res.end(data);
-				},
-				html(data: string) {
-					this.setHeader("Content-Type", "text/html");
-					res.end(data);
-				},
-				redirect(url: string, statusCode = 302) {
-					this.status(statusCode).setHeader("Location", url);
-					res.end();
-				},
-				sendFile(filePath: string) {
-					stat(filePath, (err, stats) => {
-						if (err) {
-							console.error(`File error: ${err.message}`);
-							this.status(404).json({ error: "File not found" });
-							return;
-						}
+      let middlewareIdx = 0;
 
-						if (!stats.isFile()) {
-							console.error(`Attempt to access non-file: ${filePath}`);
-							this.status(400).json({ error: "Invalid file request" });
-							return;
-						}
+      const ctx: RequestContext = {
+        req,
+        res,
+        params: {},
+        searchParams,
+        body: (() => {
+          let parsedBody: unknown;
+          return async () => {
+            if (!parsedBody) {
+              try {
+                parsedBody = await bodyParser(req, res, maxBodySize);
+              } catch (err) {
+                console.error("Error parsing request body:", err);
+              }
+            }
+            return parsedBody;
+          };
+        })(),
+        env: process.env,
 
-						// Determine MIME type
-						const mimeType =
-							getMimeType(filePath) || "application/octet-stream";
-						this.setHeader("Content-Type", mimeType);
+        // Response methods
+        status(code: number) {
+          res.statusCode = code;
+          return this;
+        },
+        setHeader(name: string, value: string) {
+          res.setHeader(name, value);
+          return this;
+        },
+        setHeaders(headers: Record<string, string>) {
+          for (const [key, value] of Object.entries(headers)) {
+            res.setHeader(key, value);
+          }
+          return this;
+        },
+        json(data: unknown) {
+          this.setHeader("Content-Type", "application/json");
+          res.end(JSON.stringify(data));
+        },
+        send(data: string | Buffer) {
+          if (typeof data === "string") {
+            this.setHeader("Content-Type", "text/plain");
+          }
+          res.end(data);
+        },
+        html(data: string) {
+          this.setHeader("Content-Type", "text/html");
+          res.end(data);
+        },
+        redirect(url: string, statusCode = 302) {
+          this.status(statusCode).setHeader("Location", url);
+          res.end();
+        },
+        sendFile(filePath: string) {
+          stat(filePath, (err, stats) => {
+            if (err) {
+              console.error(`File error: ${err.message}`);
+              this.status(404).json({ error: "File not found" });
+              return;
+            }
 
-						// Stream the file
-						const fileStream = createReadStream(filePath);
-						fileStream.on("error", (streamErr) => {
-							console.error(`Stream error: ${streamErr.message}`);
-							this.status(500).json({ error: "Error reading file" });
-						});
+            if (!stats.isFile()) {
+              console.error(`Attempt to access non-file: ${filePath}`);
+              this.status(400).json({ error: "Invalid file request" });
+              return;
+            }
 
-						fileStream.pipe(this.res);
-					});
-				},
-				download(filePath: string, fileName?: string) {
-					this.setHeader(
-						"Content-Disposition",
-						`attachment; filename="${fileName || basename(filePath)}"`,
-					);
-					this.sendFile(filePath);
-				},
-				sse(
-					generator:
-						| AsyncGenerator<unknown>
-						| (() => unknown | Promise<unknown>),
-					intervalMs = 1000,
-				) {
-					this.setHeaders({
-						"Content-Type": "text/event-stream",
-						"Cache-Control": "no-cache",
-						Connection: "keep-alive",
-					});
+            // Determine MIME type
+            const mimeType =
+              getMimeType(filePath) || "application/octet-stream";
+            this.setHeader("Content-Type", mimeType);
 
-					let disconnected = false; // Track disconnection state
+            // Stream the file
+            const fileStream = createReadStream(filePath);
+            fileStream.on("error", (streamErr) => {
+              console.error(`Stream error: ${streamErr.message}`);
+              this.status(500).json({ error: "Error reading file" });
+            });
 
-					// Detect client disconnect
-					this.req.on("close", () => {
-						disconnected = true;
-						this.res.end();
-					});
+            fileStream.pipe(this.res);
+          });
+        },
+        download(filePath: string, fileName?: string) {
+          this.setHeader(
+            "Content-Disposition",
+            `attachment; filename="${fileName || basename(filePath)}"`
+          );
+          this.sendFile(filePath);
+        },
+        sse(
+          generator:
+            | AsyncGenerator<unknown>
+            | (() => unknown | Promise<unknown>),
+          intervalMs = 1000
+        ) {
+          this.setHeaders({
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
+          });
 
-					if (isAsyncGenerator(generator)) {
-						const handleAsyncGenerator = async () => {
-							try {
-								for await (const data of generator) {
-									if (disconnected) break; // Stop processing if disconnected
-									this.res.write(`data: ${JSON.stringify(data)}\n\n`);
-								}
-							} catch (err) {
-								console.error("Error in SSE async generator:", err);
-								this.res.end();
-							}
-						};
+          let disconnected = false; // Track disconnection state
 
-						handleAsyncGenerator();
-					} else if (typeof generator === "function") {
-						const interval = setInterval(async () => {
-							try {
-								if (disconnected) {
-									clearInterval(interval); // Stop interval if disconnected
-									return;
-								}
-								const data = await generator();
-								this.res.write(`data: ${JSON.stringify(data)}\n\n`);
-							} catch (err) {
-								console.error("Error in SSE function:", err);
-								clearInterval(interval);
-								this.res.end();
-							}
-						}, intervalMs);
-					} else {
-						throw new Error("Invalid generator provided to SSE.");
-					}
-				},
-			};
+          // Detect client disconnect
+          this.req.on("close", () => {
+            disconnected = true;
+            this.res.end();
+          });
 
-			function next() {
-				if (middlewareIdx < applicableMiddlewares.length) {
-					const middleware = applicableMiddlewares[middlewareIdx++];
-					middleware(ctx, next);
-				} else {
-					for (const route of routes) {
-						const match = route.path.exec(path);
-						if (match && route.method === method) {
-							route.paramKeys.forEach((key, i) => {
-								ctx.params[key] = match[i + 1];
-							});
-							route.handler(ctx);
-							return;
-						}
-					}
+          if (isAsyncGenerator(generator)) {
+            const handleAsyncGenerator = async () => {
+              try {
+                for await (const data of generator) {
+                  if (disconnected) break; // Stop processing if disconnected
+                  this.res.write(`data: ${JSON.stringify(data)}\n\n`);
+                }
+              } catch (err) {
+                console.error("Error in SSE async generator:", err);
+                this.res.end();
+              }
+            };
 
-					res.writeHead(404, { "Content-Type": "text/plain" });
-					res.end("Not Found");
-				}
-			}
+            handleAsyncGenerator();
+          } else if (typeof generator === "function") {
+            const interval = setInterval(async () => {
+              try {
+                if (disconnected) {
+                  clearInterval(interval); // Stop interval if disconnected
+                  return;
+                }
+                const data = await generator();
+                this.res.write(`data: ${JSON.stringify(data)}\n\n`);
+              } catch (err) {
+                console.error("Error in SSE function:", err);
+                clearInterval(interval);
+                this.res.end();
+              }
+            }, intervalMs);
+          } else {
+            throw new Error("Invalid generator provided to SSE.");
+          }
+        },
+      };
 
-			next();
-		} catch (e) {
-			console.error(e);
-			res.writeHead(500, { "Content-Type": "text/plain" });
-			res.end("Internal Server Error");
-		}
-	}
+      function next() {
+        if (middlewareIdx < applicableMiddlewares.length) {
+          const middleware = applicableMiddlewares[middlewareIdx++];
+          middleware(ctx, next);
+        } else {
+          for (const route of routes) {
+            const match = route.path.exec(path);
+            if (match && route.method === method) {
+              route.paramKeys.forEach((key, i) => {
+                ctx.params[key] = match[i + 1];
+              });
+              route.handler(ctx);
+              return;
+            }
+          }
 
-	const middlewareCache = new Map<string, Middleware[]>();
+          const staticFile = staticFilesMap.get(path);
+          if (staticFile) {
+            ctx.sendFile(staticFile.filePath);
+            return;
+          }
 
-	function precomputeMiddlewares(path: string): Middleware[] {
-		const normalizedPath = normalizePath(path);
-		if (middlewareCache.has(normalizedPath)) {
-			return middlewareCache.get(normalizedPath) as Middleware[];
-		}
-		const matchedMiddlewares = pathMiddlewares
-			.filter((entry) => entry.path.test(path))
-			.sort((a, b) => b.path.source.length - a.path.source.length)
-			.flatMap((entry) => entry.middlewares);
-		middlewareCache.set(normalizedPath, matchedMiddlewares);
-		return matchedMiddlewares;
-	}
+          if (catchAllHandler) {
+            catchAllHandler(ctx); // Handle using the catch-all route
+          } else {
+            res.writeHead(404, { "Content-Type": "text/plain" });
+            res.end("Not Found");
+          }
+        }
+      }
 
-	function isValidPayload(payload: Record<string, unknown>): boolean {
-		const dangerousKeys = ["__proto__", "constructor", "prototype"];
-		return !Object.keys(payload).some((key) => dangerousKeys.includes(key));
-	}
+      next();
+    } catch (e) {
+      console.error(e);
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      res.end("Internal Server Error");
+    }
+  }
 
-	async function bodyParser(
-		req: IncomingMessage,
-		_res: ServerResponse,
-		maxBodySize: number,
-	): Promise<unknown> {
-		return new Promise((resolve, reject) => {
-			let totalSize = 0;
-			const chunks: Buffer[] = [];
+  const middlewareCache = new Map<string, Middleware[]>();
 
-			req.on("data", (chunk) => {
-				totalSize += chunk.length;
-				if (totalSize > maxBodySize) {
-					reject(new Error("Payload too large"));
-					req.destroy();
-				} else {
-					chunks.push(chunk);
-				}
-			});
+  function precomputeMiddlewares(path: string): Middleware[] {
+    const normalizedPath = normalizePath(path);
+    if (middlewareCache.has(normalizedPath)) {
+      return middlewareCache.get(normalizedPath) as Middleware[];
+    }
+    const matchedMiddlewares = pathMiddlewares
+      .filter((entry) => entry.path.test(path))
+      .sort((a, b) => b.path.source.length - a.path.source.length)
+      .flatMap((entry) => entry.middlewares);
+    middlewareCache.set(normalizedPath, matchedMiddlewares);
+    return matchedMiddlewares;
+  }
 
-			req.on("end", () => {
-				try {
-					const rawBody = Buffer.concat(chunks);
-					const contentType = req.headers["content-type"] || "";
+  function isValidPayload(payload: Record<string, unknown>): boolean {
+    const dangerousKeys = ["__proto__", "constructor", "prototype"];
+    return !Object.keys(payload).some((key) => dangerousKeys.includes(key));
+  }
 
-					if (contentType.includes("application/json")) {
-						const parsedBody = JSON.parse(rawBody.toString());
-						if (typeof parsedBody === "object" && !isValidPayload(parsedBody)) {
-							throw new Error("Invalid payload: dangerous keys detected");
-						}
-						resolve(parsedBody);
-					} else if (
-						contentType.includes("application/x-www-form-urlencoded")
-					) {
-						const formPayload = Object.fromEntries(
-							new URLSearchParams(rawBody.toString()),
-						);
-						if (!isValidPayload(formPayload)) {
-							throw new Error("Invalid payload: dangerous keys detected");
-						}
-						resolve(formPayload);
-					} else if (contentType.includes("text/plain")) {
-						resolve(rawBody.toString());
-					} else if (
-						contentType.includes("multipart/form-data") ||
-						contentType.includes("application/octet-stream")
-					) {
-						resolve(rawBody);
-					} else {
-						reject(new Error("Unsupported content type"));
-					}
-				} catch (err) {
-					reject(new Error("Invalid request body"));
-				}
-			});
+  async function bodyParser(
+    req: IncomingMessage,
+    _res: ServerResponse,
+    maxBodySize: number
+  ): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      let totalSize = 0;
+      const chunks: Buffer[] = [];
 
-			req.on("error", reject);
-		});
-	}
+      req.on("data", (chunk) => {
+        totalSize += chunk.length;
+        if (totalSize > maxBodySize) {
+          reject(new Error("Payload too large"));
+          req.destroy();
+        } else {
+          chunks.push(chunk);
+        }
+      });
 
-	// Automatically load routes
-	async function loadRoutes(directory: string, basePath = "") {
-		if (!fs.existsSync(directory)) {
-			console.warn(`Routes directory not found: ${directory}`);
-			return;
-		}
+      req.on("end", () => {
+        try {
+          const rawBody = Buffer.concat(chunks);
+          const contentType = req.headers["content-type"] || "";
 
-		const files = fs.readdirSync(directory);
+          if (contentType.includes("application/json")) {
+            const parsedBody = JSON.parse(rawBody.toString());
+            if (typeof parsedBody === "object" && !isValidPayload(parsedBody)) {
+              throw new Error("Invalid payload: dangerous keys detected");
+            }
+            resolve(parsedBody);
+          } else if (
+            contentType.includes("application/x-www-form-urlencoded")
+          ) {
+            const formPayload = Object.fromEntries(
+              new URLSearchParams(rawBody.toString())
+            );
+            if (!isValidPayload(formPayload)) {
+              throw new Error("Invalid payload: dangerous keys detected");
+            }
+            resolve(formPayload);
+          } else if (contentType.includes("text/plain")) {
+            resolve(rawBody.toString());
+          } else if (
+            contentType.includes("multipart/form-data") ||
+            contentType.includes("application/octet-stream")
+          ) {
+            resolve(rawBody);
+          } else {
+            reject(new Error("Unsupported content type"));
+          }
+        } catch (err) {
+          reject(new Error("Invalid request body"));
+        }
+      });
 
-		for (const file of files) {
-			const filePath = path.join(directory, file);
-			const stat = fs.statSync(filePath);
+      req.on("error", reject);
+    });
+  }
 
-			if (stat.isDirectory()) {
-				loadRoutes(filePath, path.join(basePath, file));
-			} else if (file.endsWith(".ts") || file.endsWith(".js")) {
-				let routePath = path
-					.join(basePath, file)
-					.replace(/\.[tj]s$/, "") // Remove file extensions
-					.replace(/\\/g, "/") // Normalize path separators
-					.replace(/\/index$/, "");
+  // Automatically load routes
+  async function loadRoutes(directory: string, basePath = "") {
+    if (!fs.existsSync(directory)) {
+      console.warn(`Routes directory not found: ${directory}`);
+      return;
+    }
 
-				if (filePath.endsWith("/routes/index.ts")) {
-					routePath = "/";
-				}
+    const files = fs.readdirSync(directory);
 
-				routePath = `/${routePath}`.replace(/\/+/g, "/");
+    for (const file of files) {
+      const filePath = path.join(directory, file);
+      const stat = fs.statSync(filePath);
 
-				const dynamicPath = routePath.replace(
-					/\[([^\]]+)\]/g,
-					(_, param) => `(?<${param}>[^/]+)`,
-				);
-				const paramKeys = [...routePath.matchAll(/\[([^\]]+)\]/g)].map(
-					(match) => match[1],
-				);
+      if (stat.isDirectory()) {
+        loadRoutes(filePath, path.join(basePath, file));
+      } else if (file.endsWith(".ts") || file.endsWith(".js")) {
+        let routePath = path
+          .join(basePath, file)
+          .replace(/\.[tj]s$/, "") // Remove file extensions
+          .replace(/\\/g, "/") // Normalize path separators
+          .replace(/\/index$/, "");
 
-				const module = await import(filePath);
-				const middlewares = module.MIDDLEWARE || [];
+        if (filePath.endsWith("/routes/index.ts")) {
+          routePath = "/";
+        }
 
-				if (middlewares.length > 0) {
-					pathMiddlewares.push({
-						path: new RegExp(`^${routePath}`),
-						middlewares,
-					});
-				}
+        routePath = `/${routePath}`.replace(/\/+/g, "/");
 
-				for (const method of Object.keys(module)) {
-					if (method === "MIDDLEWARE") continue;
-					const handler = module[method];
-					if (typeof handler === "function") {
-						routes.push({
-							method: method.toUpperCase(),
-							path: new RegExp(`^${dynamicPath}$`),
-							paramKeys,
-							handler,
-						});
+        const dynamicPath = routePath.replace(
+          /\[([^\]]+)\]/g,
+          (_, param) => `(?<${param}>[^/]+)`
+        );
+        const paramKeys = [...routePath.matchAll(/\[([^\]]+)\]/g)].map(
+          (match) => match[1]
+        );
 
-						console.log(
-							`Registered route: ${method.toUpperCase()} ${routePath} -> ${dynamicPath}`,
-						);
-					}
-				}
-			}
-		}
-	}
+        const module = await import(filePath);
+        const middlewares = module.MIDDLEWARE || [];
 
-	if (!existsSync(LOCAL_MIME_DB_PATH)) {
-		await fetchAndSaveMimeDb();
-	}
+        if (middlewares.length > 0) {
+          pathMiddlewares.push({
+            path: new RegExp(`^${routePath}`),
+            middlewares,
+          });
+        }
 
-	// Load routes on initialization
-	await loadRoutes(path.resolve(routesDir));
+        for (const method of Object.keys(module)) {
+          if (method === "MIDDLEWARE") continue;
+          const handler = module[method];
+          if (typeof handler === "function") {
+            routes.push({
+              method: method.toUpperCase(),
+              path: new RegExp(`^${dynamicPath}$`),
+              paramKeys,
+              handler,
+            });
 
-	const server = httpCreateServer(onRequest);
+            console.log(
+              `Registered route: ${method.toUpperCase()} ${routePath} -> ${dynamicPath}`
+            );
+          }
+        }
+      }
+    }
+  }
 
-	server.keepAliveTimeout = config.keepAliveTimeout || 10000;
-	server.headersTimeout = config.headersTimeout || 6000;
+  if (!existsSync(LOCAL_MIME_DB_PATH)) {
+    await fetchAndSaveMimeDb();
+  }
 
-	globalAgent.maxSockets = config.maxSockets || Number.POSITIVE_INFINITY;
-	globalAgent.maxFreeSockets = config.maxFreeSockets || 256;
+  // Load routes on initialization
+  await loadRoutes(path.resolve(routesDir));
 
-	/**
-	 * Close the server and cleanup resources
-	 */
-	function close() {
-		server.close();
-		requestQueue.clear();
-	}
+  const server = httpCreateServer(onRequest);
 
-	return {
-		listen: (port: number, callback?: () => void) =>
-			server.listen(port, callback),
-		close,
-		use: (path: string, middleware: Middleware) =>
-			pathMiddlewares.push({
-				path: new RegExp(`^${normalizePath(path)}`),
-				middlewares: [middleware],
-			}),
-	};
+  server.keepAliveTimeout = config.keepAliveTimeout || 10000;
+  server.headersTimeout = config.headersTimeout || 6000;
+
+  globalAgent.maxSockets = config.maxSockets || Number.POSITIVE_INFINITY;
+  globalAgent.maxFreeSockets = config.maxFreeSockets || 256;
+
+  /**
+   * Close the server and cleanup resources
+   */
+  function close() {
+    server.close();
+    requestQueue.clear();
+  }
+
+  return {
+    listen: (port: number, callback?: () => void) =>
+      server.listen(port, callback),
+    close,
+    use: (path: string, middleware: Middleware) =>
+      pathMiddlewares.push({
+        path: new RegExp(`^${normalizePath(path)}`),
+        middlewares: [middleware],
+      }),
+    setCatchAll: (handler: (ctx: RequestContext) => void) => {
+      catchAllHandler = handler;
+    },
+  };
 }
